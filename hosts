@@ -1,0 +1,3 @@
+seed-attacker:  10.9.0.1 -
+x-terminal:     10.9.0.5 02:42:0a:09:00:05
+trusted-server: 10.9.0.6 02:42:0a:09:00:06
